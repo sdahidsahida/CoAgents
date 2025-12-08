@@ -48,8 +48,8 @@ htmlcov/
 .env.*.local
 
 # Logs
-*.log
-logs/
+# *.log
+# logs/
 
 # Temporary files
 *.tmp

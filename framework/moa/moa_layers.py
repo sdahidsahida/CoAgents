@@ -3,12 +3,18 @@
 
 实现三层 agent 协同架构，用于命理分析。
 """
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from llm.client import LLMClient, get_client
 from llm.response import LLMResponse
 import prompt.moa.bazi as bazi  # type: ignore
 import prompt.moa.ziwei as ziwei  # type: ignore
 import prompt.moa.xingpan as xingpan  # type: ignore
+import os
+import logging
+from datetime import datetime
+
+# 创建logger
+logger = logging.getLogger(__name__)
 
 
 class MOALayers:
@@ -48,6 +54,8 @@ class MOALayers:
         }
         # 保持向后兼容
         self.roles = self.roles_layer1
+        # 日志目录（在process方法中设置）
+        self.log_dir: Optional[str] = None
     
     def _format_birth_info(self, year: str, month: str, day: str, hour: str, minute: str = "00") -> str:
         """
@@ -71,7 +79,9 @@ class MOALayers:
         role: str,
         user_input: str,
         max_tokens: int = 2000,
-        max_retries: int = 2
+        max_retries: int = 2,
+        layer_name: Optional[str] = None,
+        agent_name: Optional[str] = None
     ) -> LLMResponse:
         """
         调用单个 agent。
@@ -81,6 +91,8 @@ class MOALayers:
             user_input: 用户输入
             max_tokens: 最大 token 数（控制输出长度）
             max_retries: 最大重试次数
+            layer_name: 层级名称（如 "layer1"）
+            agent_name: Agent 名称（如 "bazi"）
             
         Returns:
             LLMResponse 对象
@@ -90,11 +102,98 @@ class MOALayers:
             {"role": "user", "content": user_input}
         ]
         
-        return self.client.chat(
+        response = self.client.chat(
             message=messages,
             max_tokens=max_tokens,
             max_retries=max_retries
         )
+        
+        # 保存日志
+        if self.log_dir and layer_name and agent_name:
+            self._save_agent_log(layer_name, agent_name, role, user_input, response)
+        
+        return response
+    
+    def _get_agent_number(self, layer_name: str, agent_name: str) -> int:
+        """
+        获取 agent 编号。
+        
+        Args:
+            layer_name: 层级名称（如 "layer1"）
+            agent_name: Agent 名称（如 "bazi"）
+            
+        Returns:
+            Agent 编号（1-9）
+        """
+        agent_order = ['bazi', 'ziwei', 'xingpan']
+        layer_order = ['layer1', 'layer2', 'layer3']
+        
+        layer_idx = layer_order.index(layer_name) if layer_name in layer_order else 0
+        agent_idx = agent_order.index(agent_name) if agent_name in agent_order else 0
+        
+        return layer_idx * 3 + agent_idx + 1
+    
+    def _save_agent_log(
+        self,
+        layer_name: str,
+        agent_name: str,
+        role: str,
+        user_input: str,
+        response: LLMResponse
+    ):
+        """
+        保存 agent 的输入输出日志。
+        
+        Args:
+            layer_name: 层级名称（如 "layer1"）
+            agent_name: Agent 名称（如 "bazi"）
+            role: 角色提示词
+            user_input: 用户输入
+            response: LLM 响应对象
+        """
+        if not self.log_dir:
+            return
+        
+        # 确保日志目录存在
+        os.makedirs(self.log_dir, exist_ok=True)
+        
+        # 获取 agent 编号
+        agent_number = self._get_agent_number(layer_name, agent_name)
+        
+        # 日志文件名：agent_1.log, agent_2.log, ...
+        log_filename = f"agent_{agent_number}.log"
+        log_path = os.path.join(self.log_dir, log_filename)
+        
+        # 格式化日志内容
+        log_content = []
+        log_content.append("=" * 80)
+        log_content.append(f"Agent: {layer_name} - {agent_name}")
+        log_content.append(f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        log_content.append("=" * 80)
+        log_content.append("\n【系统提示词】")
+        log_content.append("-" * 80)
+        log_content.append(role)
+        log_content.append("\n【用户输入】")
+        log_content.append("-" * 80)
+        log_content.append(user_input)
+        log_content.append("\n【Agent 输出】")
+        log_content.append("-" * 80)
+        log_content.append(response.content)
+        log_content.append("\n【响应信息】")
+        log_content.append("-" * 80)
+        log_content.append(f"模型: {response.model}")
+        log_content.append(f"Token 使用: {response.total_tokens} (Prompt: {response.prompt_tokens}, Completion: {response.completion_tokens})")
+        log_content.append(f"耗时: {response.elapsed_time:.2f}秒")
+        log_content.append(f"重试次数: {response.retry_count}")
+        if response.reasoning_content:
+            log_content.append("\n【思考过程】")
+            log_content.append("-" * 80)
+            log_content.append(response.reasoning_content)
+        log_content.append("\n" + "=" * 80 + "\n")
+        
+        # 写入日志文件（追加模式）
+        with open(log_path, 'a', encoding='utf-8') as f:
+            f.write('\n'.join(log_content))
     
     def _combine_reports(self, reports: Dict[str, LLMResponse]) -> str:
         """
@@ -141,7 +240,13 @@ class MOALayers:
         # 并行调用三个 agent
         for role_type in ['bazi', 'ziwei', 'xingpan']:
             role = self.roles_layer1[role_type]
-            response = self._call_agent(role, user_input, max_tokens=2000)
+            response = self._call_agent(
+                role, 
+                user_input, 
+                max_tokens=2000,
+                layer_name="layer1",
+                agent_name=role_type
+            )
             reports[role_type] = response
         
         return reports
@@ -167,7 +272,13 @@ class MOALayers:
         # 并行调用三个 agent
         for role_type in ['bazi', 'ziwei', 'xingpan']:
             role = self.roles_layer2[role_type]
-            response = self._call_agent(role, user_input, max_tokens=2000)
+            response = self._call_agent(
+                role, 
+                user_input, 
+                max_tokens=2000,
+                layer_name="layer2",
+                agent_name=role_type
+            )
             reports[role_type] = response
         
         return reports
@@ -207,7 +318,13 @@ class MOALayers:
         # 并行调用三个 agent
         for role_type in ['bazi', 'ziwei', 'xingpan']:
             role = self.roles_layer3[role_type]
-            response = self._call_agent(role, user_input, max_tokens=2000)
+            response = self._call_agent(
+                role, 
+                user_input, 
+                max_tokens=2000,
+                layer_name="layer3",
+                agent_name=role_type
+            )
             reports[role_type] = response
         
         return reports
@@ -240,26 +357,33 @@ class MOALayers:
         """
         birth_info = self._format_birth_info(year, month, day, hour, minute)
         
+        # 创建日志目录（基于framework名称和时间戳）
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        dir_name = f"moa_layers_{timestamp}"
+        self.log_dir = os.path.join('log', dir_name)
+        os.makedirs(self.log_dir, exist_ok=True)
+        logger.info(f"\n日志保存目录: {self.log_dir}\n")
+        
         # 第一层
-        print("=" * 80)
-        print("第一层：三个独立的命理师分别分析用户输入")
-        print("=" * 80)
+        logger.info("=" * 80)
+        logger.info("第一层：三个独立的命理师分别分析用户输入")
+        logger.info("=" * 80)
         layer1_reports = self.layer1(year, month, day, hour, minute)
-        print(f"第一层完成，生成了 {len(layer1_reports)} 份报告\n")
+        logger.info(f"第一层完成，生成了 {len(layer1_reports)} 份报告\n")
         
         # 第二层
-        print("=" * 80)
-        print("第二层：三个命理师参考第一层的报告，生成综合分析")
-        print("=" * 80)
+        logger.info("=" * 80)
+        logger.info("第二层：三个命理师参考第一层的报告，生成综合分析")
+        logger.info("=" * 80)
         layer2_reports = self.layer2(layer1_reports, birth_info)
-        print(f"第二层完成，生成了 {len(layer2_reports)} 份报告\n")
+        logger.info(f"第二层完成，生成了 {len(layer2_reports)} 份报告\n")
         
         # 第三层
-        print("=" * 80)
-        print("第三层：三个命理师参考第二层的报告和用户输入，生成最终报告")
-        print("=" * 80)
+        logger.info("=" * 80)
+        logger.info("第三层：三个命理师参考第二层的报告和用户输入，生成最终报告")
+        logger.info("=" * 80)
         layer3_reports = self.layer3(layer2_reports, year, month, day, hour, minute)
-        print(f"第三层完成，生成了 {len(layer3_reports)} 份最终报告\n")
+        logger.info(f"第三层完成，生成了 {len(layer3_reports)} 份最终报告\n")
         
         return {
             'layer1': layer1_reports,

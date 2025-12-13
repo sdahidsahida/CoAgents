@@ -1,0 +1,29 @@
+# 生产环境配置
+
+# 继承base.yaml
+app:
+  debug: false
+
+# 日志配置
+logging:
+  level: "INFO"
+  console: false
+  max_bytes: 52428800  # 50MB
+
+# LLM配置
+llm:
+  temperature: 0.5  # 更稳定的输出
+  
+# 缓存配置
+cache:
+  type: "redis"  # 使用Redis缓存
+  
+# 安全配置
+security:
+  encrypt_logs: true
+  mask_sensitive_data: true
+
+# 分析配置
+analysis:
+  save_intermediate_results: false
+  log_tool_outputs: false

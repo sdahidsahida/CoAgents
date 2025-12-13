@@ -83,3 +83,16 @@ def chat_messages():
         {"role": "user", "content": "Hello"},
     ]
 
+
+@pytest.fixture(scope="session")
+def gemini_api_key():
+    """
+    获取 Gemini API Key 的 fixture。
+    
+    如果环境变量未设置，则跳过所有需要 Gemini API 的测试。
+    """
+    api_key = os.environ.get('GEMINI_API_KEY')
+    if not api_key:
+        pytest.skip("GEMINI_API_KEY 环境变量未设置")
+    return api_key
+

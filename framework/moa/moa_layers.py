@@ -9,6 +9,7 @@ from llm.response import LLMResponse
 import prompt.moa.bazi as bazi  # type: ignore
 import prompt.moa.ziwei as ziwei  # type: ignore
 import prompt.moa.xingpan as xingpan  # type: ignore
+from framework.tools import tool_manager, extract_birth_info
 import os
 import logging
 from datetime import datetime
@@ -26,12 +27,13 @@ class MOALayers:
     第三层：三个 agent 参考第二层的三份报告和用户输入，生成最终报告
     """
     
-    def __init__(self, model: str = "chat"):
+    def __init__(self, model: Optional[str] = None):
         """
         初始化 MOA 架构。
         
         Args:
-            model: 使用的模型类型，"chat" 或 "reasoner"
+            model: 使用的模型名称，如 "deepseek-chat", "deepseek-reasoner", "gemini-2.5-flash"
+                如果为 None，则使用配置中的 chat_model
         """
         self.client = LLMClient(model=model)
         # 第一层角色提示词
@@ -218,7 +220,7 @@ class MOALayers:
         
         return "\n".join(combined)
     
-    def layer1(self, year: str, month: str, day: str, hour: str, minute: str = "00") -> Dict[str, LLMResponse]:
+    def layer1(self, year: str, month: str, day: str, hour: str, minute: str = "00", gender: str = "女", location: Optional[Dict[str, str]] = None) -> Dict[str, LLMResponse]:
         """
         第一层：三个独立的 agent 分别分析用户输入。
         
@@ -228,17 +230,56 @@ class MOALayers:
             day: 日期（字符串，如 "15" 或 "05"）
             hour: 小时（字符串，如 "14" 或 "06"）
             minute: 分钟（字符串，默认为 "00"，如 "30"）
+            gender: 性别（字符串，"男" 或 "女"）
+            location: 出生地点（字典，格式：{"lat": "39n54", "lon": "116e23"}）
             
         Returns:
             包含三份报告的字典
         """
         birth_info = self._format_birth_info(year, month, day, hour, minute)
-        user_input = f"{birth_info}"
+        
+        # 转换为整数用于工具调用
+        year_int = int(year)
+        month_int = int(month)
+        day_int = int(day)
+        hour_int = int(hour)
+        minute_int = int(minute)
         
         reports = {}
+        tool_results = {}
         
-        # 并行调用三个 agent
+        # 为每个agent调用对应的工具
         for role_type in ['bazi', 'ziwei', 'xingpan']:
+            # 映射到工具类型
+            tool_type = {
+                'bazi': 'bazi',
+                'ziwei': 'ziwei',
+                'xingpan': 'astrology'
+            }[role_type]
+            
+            # 调用工具计算
+            tool_result = tool_manager.calculate(
+                tool_type=tool_type,
+                year=year_int,
+                month=month_int,
+                day=day_int,
+                hour=hour_int,
+                minute=minute_int,
+                gender=gender,
+                location=location
+            )
+            
+            tool_results[role_type] = tool_result
+            
+            # 格式化工具结果
+            if tool_result.get("success"):
+                tool_text = tool_manager.format_for_prompt(tool_type, tool_result)
+                user_input = f"{birth_info}\n性别：{gender}\n{tool_text}"
+            else:
+                logger.warning(f"{tool_type} tool failed: {tool_result.get('error')}")
+                user_input = f"{birth_info}\n性别：{gender}\n\n注意：{tool_type}工具计算失败，请基于生辰信息进行分析。"
+            
+            # 调用agent
             role = self.roles_layer1[role_type]
             response = self._call_agent(
                 role, 
@@ -248,6 +289,11 @@ class MOALayers:
                 agent_name=role_type
             )
             reports[role_type] = response
+        
+        # 保存工具结果到报告
+        for role_type, report in reports.items():
+            if hasattr(report, 'tool_result'):
+                report.tool_result = tool_results.get(role_type)
         
         return reports
     
@@ -335,7 +381,9 @@ class MOALayers:
         month: str,
         day: str,
         hour: str,
-        minute: str = "00"
+        minute: str = "00",
+        gender: str = "女",
+        location: Optional[Dict[str, str]] = None
     ) -> Dict[str, Dict[str, LLMResponse]]:
         """
         执行完整的三层处理流程。
@@ -346,6 +394,8 @@ class MOALayers:
             day: 日期（字符串，如 "15" 或 "05"）
             hour: 小时（字符串，如 "14" 或 "06"）
             minute: 分钟（字符串，默认为 "00"，如 "30"）
+            gender: 性别（字符串，"男" 或 "女"）
+            location: 出生地点（字典，格式：{"lat": "39n54", "lon": "116e23"}）
             
         Returns:
             包含三层报告的字典，结构为：
@@ -363,12 +413,15 @@ class MOALayers:
         self.log_dir = os.path.join('log', dir_name)
         os.makedirs(self.log_dir, exist_ok=True)
         logger.info(f"\n日志保存目录: {self.log_dir}\n")
+        logger.info(f"出生信息：{birth_info}，性别：{gender}")
+        if location:
+            logger.info(f"出生地点：{location}")
         
         # 第一层
         logger.info("=" * 80)
         logger.info("第一层：三个独立的命理师分别分析用户输入")
         logger.info("=" * 80)
-        layer1_reports = self.layer1(year, month, day, hour, minute)
+        layer1_reports = self.layer1(year, month, day, hour, minute, gender, location)
         logger.info(f"第一层完成，生成了 {len(layer1_reports)} 份报告\n")
         
         # 第二层

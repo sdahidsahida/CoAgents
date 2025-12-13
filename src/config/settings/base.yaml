@@ -1,0 +1,84 @@
+# 基础配置
+# 所有环境共享的配置
+
+# 应用配置
+app:
+  name: "Astrology Analysis System"
+  version: "2.0.0"
+  debug: false
+  timezone: "Asia/Shanghai"
+
+# 日志配置
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "logs/app.log"
+  max_bytes: 10485760  # 10MB
+  backup_count: 5
+
+# 缓存配置
+cache:
+  type: "memory"  # memory, redis
+  ttl: 3600  # 默认过期时间（秒）
+  
+  # Redis配置（当type=redis时）
+  redis:
+    host: "localhost"
+    port: 6379
+    db: 0
+    password: null
+
+# LLM配置
+llm:
+  provider: "deepseek"  # deepseek, gemini
+  default_model: "deepseek-chat"
+  max_retries: 3
+  temperature: 0.7
+  max_tokens: 2000
+  timeout: 30
+  
+  # DeepSeek配置
+  deepseek:
+    base_url: "https://api.deepseek.com/v1"
+    api_key: ""  # 通过环境变量设置
+    model: "deepseek-chat"
+    pricing:
+      prompt: 0.000014
+      completion: 0.000028
+  
+  # Gemini配置
+  gemini:
+    api_key: ""  # 通过环境变量设置
+    model: "gemini-2.0-flash-exp"
+
+# 算命工具配置
+tools:
+  enabled: ["bazi", "ziwei", "astrology"]
+  timeout: 30  # 单个工具计算超时时间
+  
+  # 八字工具配置
+  bazi:
+    python_path: "python"
+    script_path: "lib/bazi/bazi.py"
+    
+  # 紫微斗数工具配置
+  ziwei:
+    package: "py-iztro"
+    
+  # 西方占星工具配置
+  astrology:
+    ephemeris_path: "lib/flatlib/flatlib/resources/swefiles"
+
+# 分析配置
+analysis:
+  # MOA三层配置
+  moa:
+    layer1_tokens: 2000
+    layer2_tokens: 2000
+    layer3_tokens: 2000
+    
+  # 报告配置
+  report:
+    format: "markdown"  # markdown, html, json
+    include_metadata: true
+    include_chart_data: false

@@ -56,8 +56,8 @@ def calculate_astrology_chart(
         # 创建地理位置对象
         pos = GeoPos(location["lat"], location["lon"])
         
-        # 创建星盘
-        chart = Chart(datetime_obj, pos)
+        # 创建星盘 - include all objects (modern planets)
+        chart = Chart(datetime_obj, pos, IDs=const.LIST_OBJECTS)
         
         # 提取星体信息
         astrology_data = {
@@ -151,14 +151,14 @@ def calculate_astrology_chart(
             planet1 = chart.get(planet1_id)
             planet2 = chart.get(planet2_id)
             if planet1 and planet2:
-                aspect = getAspect(planet1, planet2, 10)  # 10度容许度
-                if aspect:
+                aspect = getAspect(planet1, planet2, const.MAJOR_ASPECTS)  # 主要相位
+                if aspect and aspect.exists():
                     planet1_name = next((name for pid, name in planets if pid == planet1_id), str(planet1_id))
                     planet2_name = next((name for pid, name in planets if pid == planet2_id), str(planet2_id))
                     aspects.append({
                         "planet1": planet1_name,
                         "planet2": planet2_name,
-                        "aspect": aspect.name,
+                        "aspect": aspect.type,
                         "orb": str(aspect.orb)
                     })
         
@@ -200,6 +200,7 @@ def calculate_astrology_chart(
         return astrology_data
         
     except Exception as e:
+        logger.error(f"Astrology calculation error: {e}")
         return {
             "success": False,
             "error": str(e)

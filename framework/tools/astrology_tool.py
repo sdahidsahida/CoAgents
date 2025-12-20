@@ -231,8 +231,8 @@ def format_astrology_for_prompt(astrology_data: Dict[str, Any]) -> str:
     # 添加行星位置
     for planet_name, info in astrology_data.get("planets", {}).items():
         retrograde_text = "（逆行）" if info.get("retrograde") else ""
-        prompt_text += f"\n{planet_name}：{info['sign']}{retrograde}"
-    
+        prompt_text += f"\n{planet_name}：{info['sign']}{retrograde_text}"
+
     # 添加四角
     prompt_text += "\n\n四角："
     for angle_name, info in astrology_data.get("angles", {}).items():

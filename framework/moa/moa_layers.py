@@ -9,6 +9,7 @@ from llm.response import LLMResponse
 import prompt.moa.bazi as bazi  # type: ignore
 import prompt.moa.ziwei as ziwei  # type: ignore
 import prompt.moa.xingpan as xingpan  # type: ignore
+import prompt.moa.final as final_prompt  # type: ignore
 from framework.tools import tool_manager, extract_birth_info
 import os
 import logging
@@ -53,6 +54,16 @@ class MOALayers:
             'bazi': bazi.ROLE_LAYER3,
             'ziwei': ziwei.ROLE_LAYER3,
             'xingpan': xingpan.ROLE_LAYER3,
+        }
+        # 第四层（总编聚合）角色提示词：将三系输出按领域权重融合为一份最终报告
+        self.role_layer4 = final_prompt.ROLE_LAYER4
+
+        # 默认领域权重（可后续用数据集标注/评测再校准）
+        # 分数越高代表该体系在该领域的相对置信度越高（用于融合时的“主/辅参考”权重）
+        self.domain_weights = {
+            "personality": {"bazi": 50, "ziwei": 70, "xingpan": 70},
+            "wealth_career": {"bazi": 80, "ziwei": 82, "xingpan": 72},
+            "fortune_cycles": {"bazi": 90, "ziwei": 85, "xingpan": 78},
         }
         # 保持向后兼容
         self.roles = self.roles_layer1
@@ -274,7 +285,11 @@ class MOALayers:
             # 格式化工具结果
             if tool_result.get("success"):
                 tool_text = tool_manager.format_for_prompt(tool_type, tool_result)
-                user_input = f"{birth_info}\n性别：{gender}\n{tool_text}"
+                user_input = (
+                    f"{birth_info}\n"
+                    f"【硬约束】性别={gender}。你必须以{gender}命盘解读，禁止输出“女命/男命”与该性别相反的表述。\n"
+                    f"{tool_text}"
+                )
             else:
                 logger.warning(f"{tool_type} tool failed: {tool_result.get('error')}")
                 user_input = f"{birth_info}\n性别：{gender}\n\n注意：{tool_type}工具计算失败，请基于生辰信息进行分析。"
@@ -294,7 +309,23 @@ class MOALayers:
         for role_type, report in reports.items():
             if hasattr(report, 'tool_result'):
                 report.tool_result = tool_results.get(role_type)
-        
+        # ===== 新增：缓存“工具原文区”，供 layer2/layer3 使用（避免字段漂移）=====
+        try:
+            bazi_txt = tool_manager.format_for_prompt("bazi", tool_results.get("bazi", {}))
+            ziwei_txt = tool_manager.format_for_prompt("ziwei", tool_results.get("ziwei", {}))
+            xingpan_txt = tool_manager.format_for_prompt("astrology", tool_results.get("xingpan", {}))
+            self._latest_tool_block = (
+                    "【工具原文（事实源，字段必须原样照抄，不得改写）】\n"
+                    + bazi_txt + "\n"
+                    + ziwei_txt + "\n"
+                    + xingpan_txt + "\n"
+            )
+        except Exception as e:
+            # 不影响主流程，最多就是 layer2/3 少一份“事实源”
+            logger.warning(f"build _latest_tool_block failed: {e}")
+            self._latest_tool_block = ""
+        # ===== 新增结束 =====
+
         return reports
     
     def layer2(self, layer1_reports: Dict[str, LLMResponse], birth_info: str) -> Dict[str, LLMResponse]:
@@ -310,9 +341,17 @@ class MOALayers:
         """
         # 合并第一层的报告
         combined_reports = self._combine_reports(layer1_reports)
-        
-        user_input = f"{birth_info}\n\n以下是来自其他命理师的三份报告：\n{combined_reports}"
-        
+
+        tool_block = getattr(self, "_latest_tool_block", "")
+        user_input = (
+            f"{birth_info}\n"
+            f"{tool_block}\n"
+            "【硬约束-字段一致性】\n"
+            "1) 上方《工具原文》是唯一事实源（四柱/五行局/命宫主星/行星落座等字段必须原样照抄）。\n"
+            "2) 若下方报告与工具原文冲突，以工具原文为准；不确定就直接引用工具原文，禁止脑补改写。\n\n"
+            f"以下是来自其他命理师的三份报告：\n{combined_reports}"
+        )
+
         reports = {}
         
         # 并行调用三个 agent
@@ -336,7 +375,8 @@ class MOALayers:
         month: str,
         day: str,
         hour: str,
-        minute: str = "00"
+        minute: str = "00",
+        gender: str = "女"
     ) -> Dict[str, LLMResponse]:
         """
         第三层：三个 agent 参考第二层的三份报告和用户输入，生成最终报告。
@@ -353,12 +393,24 @@ class MOALayers:
             包含最终三份报告的字典
         """
         birth_info = self._format_birth_info(year, month, day, hour, minute)
-        
+        birth_info += (
+            f"\n性别：{gender}\n"
+            f"【硬约束】性别={gender}。你必须以{gender}命盘解读，禁止输出与该性别相反的“女命/男命”。\n"
+        )
+
         # 合并第二层的报告
         combined_reports = self._combine_reports(layer2_reports)
-        
-        user_input = f"{birth_info}\n\n以下是来自其他命理师的三份综合分析报告：\n{combined_reports}"
-        
+
+        tool_block = getattr(self, "_latest_tool_block", "")
+        user_input = (
+            f"{birth_info}\n"
+            f"{tool_block}\n"
+            "【硬约束-字段一致性】\n"
+            "1) 上方《工具原文》是唯一事实源（四柱/五行局/命宫主星/行星落座等字段必须原样照抄）。\n"
+            "2) 若下方综合报告与工具原文冲突，以工具原文为准；不确定就直接引用工具原文，禁止脑补改写。\n\n"
+            f"以下是来自其他命理师的三份综合分析报告：\n{combined_reports}"
+        )
+
         reports = {}
         
         # 并行调用三个 agent
@@ -375,6 +427,59 @@ class MOALayers:
         
         return reports
     
+    def layer4(
+        self,
+        layer3_reports: Dict[str, LLMResponse],
+        birth_info: str,
+        gender: str,
+        location: Optional[Dict[str, str]] = None,
+        weights: Optional[Dict[str, Dict[str, int]]] = None,
+    ) -> LLMResponse:
+        """
+        第四层（总编聚合）：按“领域权重”融合三系最终报告，生成单一最终报告。
+        """
+        w = weights or getattr(self, "domain_weights", None) or {
+            "personality": {"bazi": 50, "ziwei": 70, "xingpan": 70},
+            "wealth_career": {"bazi": 80, "ziwei": 82, "xingpan": 72},
+            "fortune_cycles": {"bazi": 90, "ziwei": 85, "xingpan": 78},
+        }
+
+        weight_table = (
+            "【领域权重（默认，可后续校准）】\n"
+            "维度/体系 | 八字 | 紫微 | 星盘\n"
+            f"性格人格   | {w['personality']['bazi']} | {w['personality']['ziwei']} | {w['personality']['xingpan']}\n"
+            f"财官福禄   | {w['wealth_career']['bazi']} | {w['wealth_career']['ziwei']} | {w['wealth_career']['xingpan']}\n"
+            f"大运流年   | {w['fortune_cycles']['bazi']} | {w['fortune_cycles']['ziwei']} | {w['fortune_cycles']['xingpan']}\n"
+        )
+
+        tool_block = getattr(self, "_latest_tool_block", "")
+        loc_txt = f"\n出生地点：{location}" if location else ""
+
+        combined_reports = self._combine_reports(layer3_reports)
+
+        user_input = (
+            f"{birth_info}\n"
+            f"性别：{gender}{loc_txt}\n"
+            f"{tool_block}\n"
+            f"{weight_table}\n"
+            "【输入材料】以下是三系（八字/紫微/星盘）在第三层生成的最终报告（可能存在转述误差）：\n"
+            f"{combined_reports}\n\n"
+            "【你的任务】你是‘总编/裁决器’，需要基于《工具原文（事实源）》与三系报告，产出一份统一的最终命理报告。\n"
+            "- 输出必须分为三大板块：①性格人格 ②财官福禄 ③大运流年。每个板块内：先给结论，再给依据推导。\n"
+            "- 依据推导必须引用工具事实（如四柱、命宫主星、行星落座等）作为证据锚点；工具原文未提供的字段一律不得当作事实输出。\n"
+            "- 融合规则：按‘领域权重’确定主参考体系（权重最高者为主，次高者为辅）。若出现冲突：说明冲突点，并按权重选择更可信的表述；无法判断则保留分歧并提示需进一步校验。\n"
+            "- 表述风格：保持专业、结构化、不过度玄学；避免空话套话；给出可执行建议与风险提示。\n"
+        )
+
+        return self._call_agent(
+            self.role_layer4,
+            user_input,
+            max_tokens=2500,
+            layer_name="layer4",
+            agent_name="final",
+        )
+
+
     def process(
         self,
         year: str,
@@ -406,7 +511,12 @@ class MOALayers:
             }
         """
         birth_info = self._format_birth_info(year, month, day, hour, minute)
-        
+        guard = (
+            f"性别：{gender}\n"
+            f"【硬约束】性别={gender}。你必须以{gender}命盘解读，禁止输出与该性别相反的“女命/男命”。\n"
+        )
+        birth_info_guarded = f"{birth_info}\n{guard}"
+
         # 创建日志目录（基于framework名称和时间戳）
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         dir_name = f"moa_layers_{timestamp}"
@@ -428,35 +538,50 @@ class MOALayers:
         logger.info("=" * 80)
         logger.info("第二层：三个命理师参考第一层的报告，生成综合分析")
         logger.info("=" * 80)
-        layer2_reports = self.layer2(layer1_reports, birth_info)
+        layer2_reports = self.layer2(layer1_reports, birth_info_guarded)
+
         logger.info(f"第二层完成，生成了 {len(layer2_reports)} 份报告\n")
         
         # 第三层
         logger.info("=" * 80)
         logger.info("第三层：三个命理师参考第二层的报告和用户输入，生成最终报告")
         logger.info("=" * 80)
-        layer3_reports = self.layer3(layer2_reports, year, month, day, hour, minute)
+        layer3_reports = self.layer3(layer2_reports, year, month, day, hour, minute, gender)
         logger.info(f"第三层完成，生成了 {len(layer3_reports)} 份最终报告\n")
+
+        # 第四层（总编聚合）
+        logger.info("=" * 80)
+        logger.info("第四层：总编聚合三系最终报告，按领域权重生成统一最终报告")
+        logger.info("=" * 80)
+        layer4_report = self.layer4(layer3_reports, birth_info_guarded, gender, location=location)
+        logger.info("第四层完成，生成了 1 份统一最终报告\n")
+
         
         return {
             'layer1': layer1_reports,
             'layer2': layer2_reports,
-            'layer3': layer3_reports
+            'layer3': layer3_reports,
+            'layer4': {'final': layer4_report}
         }
     
     def get_final_reports(self, results: Dict[str, Dict[str, LLMResponse]]) -> Dict[str, str]:
         """
-        从处理结果中提取最终报告（第三层）。
-        
+        从处理结果中提取最终报告。
+
+        - 返回三系第三层最终报告：bazi / ziwei / xingpan
+        - 若存在第四层聚合结果，则额外返回 final
+
         Args:
             results: process() 方法的返回结果
-            
+
         Returns:
             包含最终报告内容的字典
         """
         layer3 = results.get('layer3', {})
+        layer4 = results.get('layer4', {})
         return {
             'bazi': layer3.get('bazi', LLMResponse("", "", {}, "", 0)).content,
             'ziwei': layer3.get('ziwei', LLMResponse("", "", {}, "", 0)).content,
             'xingpan': layer3.get('xingpan', LLMResponse("", "", {}, "", 0)).content,
+            'final': layer4.get('final', LLMResponse("", "", {}, "", 0)).content,
         }

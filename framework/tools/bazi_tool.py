@@ -7,6 +7,8 @@ import os
 import sys
 import subprocess
 import json
+import re
+
 from typing import Dict, Any, Optional
 from datetime import datetime
 
@@ -32,14 +34,15 @@ def calculate_bazi(year: int, month: int, day: int, hour: int, minute: int = 0, 
     try:
         # 构建命令
         cmd = [
-            sys.executable, 
-            os.path.join(BAZI_PATH, 'bazi.py'),
-            str(year),
-            str(month),
-            str(day),
-            str(hour)
+            sys.executable,
+            os.path.join(BAZI_PATH, "bazi.py"),
+            "-g",  # 关键：公历
+            str(year), str(month), str(day), str(hour)
         ]
-        
+        # 女命可选：如果 bazi.py 支持 -n
+        if str(gender).strip() in ("女", "F", "f", "female"):
+            cmd.insert(2, "-n")
+
         # 执行bazi计算
         result = subprocess.run(
             cmd,
@@ -76,27 +79,31 @@ def calculate_bazi(year: int, month: int, day: int, hour: int, minute: int = 0, 
             "analysis": {},
             "raw_output": result.stdout
         }
-        
-        # 解析八字四柱
+
+        # 解析八字四柱 + 农历日期
         for line in output_lines:
             if "公历:" in line and "农历:" in line:
                 parts = line.split("农历:")
                 if len(parts) > 1:
                     bazi_data["lunar_date"] = parts[1].split()[0]
-            
-            # 查找八字四柱（通常在包含庚、壬、癸、己等天干的行）
-            if "庚" in line and "壬" in line and "癸" in line and "己" in line:
-                # 这一行通常包含四柱
-                stems = []
-                for char in line:
-                    if char in ["甲", "乙", "丙", "丁", "戊", "己", "庚", "辛", "壬", "癸"]:
-                        stems.append(char)
-                if len(stems) >= 4:
-                    bazi_data["bazi_pillars"]["year"] = stems[0]
-                    bazi_data["bazi_pillars"]["month"] = stems[1]
-                    bazi_data["bazi_pillars"]["day"] = stems[2]
-                    bazi_data["bazi_pillars"]["hour"] = stems[3]
-        
+
+            # 直接抓 “四柱：壬午 戊申 乙卯 壬午” 这种输出
+            if "四柱" in line:
+                m = re.search(
+                    r"四柱[:：]\s*"
+                    r"([甲乙丙丁戊己庚辛壬癸][子丑寅卯辰巳午未申酉戌亥])\s+"
+                    r"([甲乙丙丁戊己庚辛壬癸][子丑寅卯辰巳午未申酉戌亥])\s+"
+                    r"([甲乙丙丁戊己庚辛壬癸][子丑寅卯辰巳午未申酉戌亥])\s+"
+                    r"([甲乙丙丁戊己庚辛壬癸][子丑寅卯辰巳午未申酉戌亥])",
+                    line
+                )
+                if m:
+                    bazi_data["bazi_pillars"]["year"] = m.group(1)
+                    bazi_data["bazi_pillars"]["month"] = m.group(2)
+                    bazi_data["bazi_pillars"]["day"] = m.group(3)
+                    bazi_data["bazi_pillars"]["hour"] = m.group(4)
+                    break  # 找到就退出循环，避免后面误覆盖
+
         # 解析五行
         for line in output_lines:
             if "金:" in line and "木:" in line and "水:" in line:

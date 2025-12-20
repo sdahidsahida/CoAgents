@@ -124,22 +124,26 @@ def main():
     print("- 八字报告：基于专业八字库计算的四柱、五行、神煞等")
     print("- 紫微斗数报告：基于专业紫微斗数库计算的十二宫位、星曜分布等")
     print("- 星盘报告：基于专业占星库计算的行星位置、宫位系统等")
+    print("- 最终汇总报告：基于三系结论按领域权重（性格/财官福禄/大运流年）进行加权融合，对MOA架构各层结果对齐后输出")
     print()
-    
+
     report_names = {
         'bazi': '八字命理报告',
         'ziwei': '紫微斗数报告',
-        'xingpan': '星盘占星报告'
+        'xingpan': '星盘占星报告',
+        'final': '最终融合报告（按领域权重）'
     }
-    
+
     for report_type, content in final_reports.items():
         print(f"\n{'=' * 80}")
         print(f"{report_names[report_type]}")
         print(f"{'=' * 80}")
         print(content)
         print(f"\n报告长度: {len(content)} 字符")
-        print(f"Token 统计: {results['layer3'][report_type].total_tokens}")
-        print(f"耗时: {results['layer3'][report_type].elapsed_time:.2f}秒")
+        # final 来自 layer4，其余来自 layer3
+        resp_obj = results['layer4']['final'] if report_type == 'final' else results['layer3'][report_type]
+        print(f"Token 统计: {resp_obj.total_tokens}")
+        print(f"耗时: {resp_obj.elapsed_time:.2f}秒")
     
     # 打印统计信息
     print("\n" + "=" * 80)
@@ -148,8 +152,29 @@ def main():
     
     total_tokens = 0
     total_time = 0
-    
-    for layer_name in ['layer1', 'layer2', 'layer3']:
+
+    def _layer_stats(layer_obj):
+        """layer_obj: dict like {'bazi': resp, 'ziwei': resp, ...} where resp has .usage/.elapsed"""
+        total_tokens = 0
+        total_time = 0.0
+        if not isinstance(layer_obj, dict):
+            return 0, 0.0
+        for _, resp in layer_obj.items():
+            # resp 可能是 LLMResponse 或类似对象
+            try:
+                total_tokens += int(getattr(getattr(resp, "usage", None), "total_tokens", 0) or 0)
+            except Exception:
+                pass
+            try:
+                total_time += float(getattr(resp, "elapsed", 0.0) or 0.0)
+            except Exception:
+                pass
+        return total_tokens, total_time
+
+    print("\n" + "=" * 80)
+    print("分层统计（MoA Layers）")
+
+    for layer_name in ['layer1', 'layer2', 'layer3', 'layer4']:
         layer_tokens = sum(r.total_tokens for r in results[layer_name].values())
         layer_time = sum(r.elapsed_time for r in results[layer_name].values())
         total_tokens += layer_tokens

@@ -14,6 +14,7 @@ from framework.tools import tool_manager, extract_birth_info
 import os
 import logging
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # 创建logger
 logger = logging.getLogger(__name__)
@@ -37,6 +38,9 @@ class MOALayers:
                 如果为 None，则使用配置中的 chat_model
         """
         self.client = LLMClient(model=model)
+        keys = os.getenv("DEEPSEEK_API_KEYS", "").strip()
+        self._api_keys = [k.strip() for k in keys.split(",") if k.strip()]
+
         # 第一层角色提示词
         self.roles_layer1 = {
             'bazi': bazi.ROLE_LAYER1,
@@ -126,7 +130,79 @@ class MOALayers:
             self._save_agent_log(layer_name, agent_name, role, user_input, response)
         
         return response
-    
+
+    def _run_agents_parallel(
+            self,
+            roles: Dict[str, str],
+            user_input: str,
+            layer_name: str,
+            max_tokens: int = 2000,
+            max_retries: int = 2,
+            max_workers: int = 3,
+    ) -> Dict[str, LLMResponse]:
+        """
+        并行调用多个 agent（同一层的 bazi/ziwei/xingpan）
+        - 每个线程创建独立 LLMClient（避免线程安全问题）
+        - 支持多 Key：从环境变量 DEEPSEEK_API_KEYS=key1,key2,key3 读取
+        - 计时日志：打印每个线程的 START/END 和 dt
+        """
+
+        def _pick_key(role_type: str) -> Optional[str]:
+            keys = getattr(self, "_api_keys", None) or []
+            if not keys:
+                return None
+            mapping = {"bazi": 0, "ziwei": 1, "xingpan": 2}
+            idx = mapping.get(role_type, 0) % len(keys)
+            return keys[idx]
+
+        def _one(role_type: str, role_prompt: str) -> Tuple[str, LLMResponse]:
+            api_key = _pick_key(role_type)
+            logger.info(f"[multi-key] {layer_name}:{role_type} key=***{(api_key or '')[-4:]}")
+
+            # 每线程一个 client
+            tmp_client = LLMClient(
+                model=getattr(self.client, "model_name", None) or getattr(self.client, "model", None),
+                api_key=api_key,
+                base_url=os.getenv("DEEPSEEK_BASE_URL", None),
+            )
+
+            messages = [
+                {"role": "system", "content": role_prompt},
+                {"role": "user", "content": user_input},
+            ]
+
+            import time
+            t0 = time.time()
+            logger.info(f"[parallel] START {layer_name}:{role_type} t={t0:.3f}")
+
+            resp = tmp_client.chat(
+                message=messages,
+                max_tokens=max_tokens,
+                max_retries=max_retries,
+            )
+
+            t1 = time.time()
+            logger.info(f"[parallel] END   {layer_name}:{role_type} t={t1:.3f} dt={t1 - t0:.2f}s")
+
+            # 保存日志（每个 agent 写不同文件，线程并发安全）
+            if self.log_dir:
+                self._save_agent_log(layer_name, role_type, role_prompt, user_input, resp)
+
+            return role_type, resp
+
+        reports: Dict[str, LLMResponse] = {}
+
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = {ex.submit(_one, rt, rp): rt for rt, rp in roles.items()}
+
+            for fut in as_completed(futures):
+                role_type = futures[fut]
+                # 注意：这里不要手搓 LLMResponse（你项目里构造参数很复杂）
+                k, v = fut.result()  # 如果失败，直接抛出，让你看见真实错误
+                reports[k] = v
+
+        return reports
+
     def _get_agent_number(self, layer_name: str, agent_name: str) -> int:
         """
         获取 agent 编号。
@@ -230,45 +306,41 @@ class MOALayers:
             combined.append(f"=== {type_name} ===\n{response.content}\n")
         
         return "\n".join(combined)
-    
-    def layer1(self, year: str, month: str, day: str, hour: str, minute: str = "00", gender: str = "女", location: Optional[Dict[str, str]] = None) -> Dict[str, LLMResponse]:
+
+    def layer1(
+            self,
+            year: str,
+            month: str,
+            day: str,
+            hour: str,
+            minute: str = "00",
+            gender: str = "女",
+            location: Optional[Dict[str, str]] = None
+    ) -> Dict[str, LLMResponse]:
         """
-        第一层：三个独立的 agent 分别分析用户输入。
-        
-        Args:
-            year: 年份（字符串，如 "1990"）
-            month: 月份（字符串，如 "5" 或 "05"）
-            day: 日期（字符串，如 "15" 或 "05"）
-            hour: 小时（字符串，如 "14" 或 "06"）
-            minute: 分钟（字符串，默认为 "00"，如 "30"）
-            gender: 性别（字符串，"男" 或 "女"）
-            location: 出生地点（字典，格式：{"lat": "39n54", "lon": "116e23"}）
-            
-        Returns:
-            包含三份报告的字典
+        第一层：三个独立的 agent 分别分析用户输入（工具排盘顺序；LLM 并行）。
         """
         birth_info = self._format_birth_info(year, month, day, hour, minute)
-        
+
         # 转换为整数用于工具调用
         year_int = int(year)
         month_int = int(month)
         day_int = int(day)
         hour_int = int(hour)
         minute_int = int(minute)
-        
-        reports = {}
-        tool_results = {}
-        
-        # 为每个agent调用对应的工具
-        for role_type in ['bazi', 'ziwei', 'xingpan']:
-            # 映射到工具类型
+
+        # ===== 1) 先顺序跑工具，准备每个 agent 的 user_input =====
+        reports: Dict[str, LLMResponse] = {}
+        tool_results: Dict[str, Any] = {}
+        inputs: Dict[str, str] = {}
+
+        for role_type in ["bazi", "ziwei", "xingpan"]:
             tool_type = {
-                'bazi': 'bazi',
-                'ziwei': 'ziwei',
-                'xingpan': 'astrology'
+                "bazi": "bazi",
+                "ziwei": "ziwei",
+                "xingpan": "astrology",
             }[role_type]
-            
-            # 调用工具计算
+
             tool_result = tool_manager.calculate(
                 tool_type=tool_type,
                 year=year_int,
@@ -277,12 +349,10 @@ class MOALayers:
                 hour=hour_int,
                 minute=minute_int,
                 gender=gender,
-                location=location
+                location=location,
             )
-            
             tool_results[role_type] = tool_result
-            
-            # 格式化工具结果
+
             if tool_result.get("success"):
                 tool_text = tool_manager.format_for_prompt(tool_type, tool_result)
                 user_input = (
@@ -292,24 +362,14 @@ class MOALayers:
                 )
             else:
                 logger.warning(f"{tool_type} tool failed: {tool_result.get('error')}")
-                user_input = f"{birth_info}\n性别：{gender}\n\n注意：{tool_type}工具计算失败，请基于生辰信息进行分析。"
-            
-            # 调用agent
-            role = self.roles_layer1[role_type]
-            response = self._call_agent(
-                role, 
-                user_input, 
-                max_tokens=2000,
-                layer_name="layer1",
-                agent_name=role_type
-            )
-            reports[role_type] = response
-        
-        # 保存工具结果到报告
-        for role_type, report in reports.items():
-            if hasattr(report, 'tool_result'):
-                report.tool_result = tool_results.get(role_type)
-        # ===== 新增：缓存“工具原文区”，供 layer2/layer3 使用（避免字段漂移）=====
+                user_input = (
+                    f"{birth_info}\n性别：{gender}\n\n"
+                    f"注意：{tool_type}工具计算失败，请基于生辰信息进行分析。"
+                )
+
+            inputs[role_type] = user_input
+
+        # ===== 2) 缓存“工具原文区”，供 layer2/layer3 使用（保持你现有逻辑）=====
         try:
             bazi_txt = tool_manager.format_for_prompt("bazi", tool_results.get("bazi", {}))
             ziwei_txt = tool_manager.format_for_prompt("ziwei", tool_results.get("ziwei", {}))
@@ -321,13 +381,62 @@ class MOALayers:
                     + xingpan_txt + "\n"
             )
         except Exception as e:
-            # 不影响主流程，最多就是 layer2/3 少一份“事实源”
             logger.warning(f"build _latest_tool_block failed: {e}")
             self._latest_tool_block = ""
-        # ===== 新增结束 =====
+
+        # ===== 3) 并行调用 layer1 的三个 agent（每个线程独立 client + 多 key）=====
+        def _pick_key(rt: str) -> Optional[str]:
+            keys = getattr(self, "_api_keys", None) or []
+            if not keys:
+                return None
+            mapping = {"bazi": 0, "ziwei": 1, "xingpan": 2}
+            idx = mapping.get(rt, 0) % len(keys)
+            return keys[idx]
+
+        def _one(rt: str) -> Tuple[str, LLMResponse]:
+            role_prompt = self.roles_layer1[rt]
+            user_input_i = inputs[rt]
+
+            api_key = _pick_key(rt)
+            logger.info(f"[multi-key] layer1:{rt} key=***{(api_key or '')[-4:]}")
+
+            tmp_client = LLMClient(
+                model=getattr(self.client, "model_name", None) or getattr(self.client, "model", None),
+                api_key=api_key,
+                base_url=os.getenv("DEEPSEEK_BASE_URL", None),
+            )
+
+            messages = [
+                {"role": "system", "content": role_prompt},
+                {"role": "user", "content": user_input_i},
+            ]
+
+            import time
+            t0 = time.time()
+            logger.info(f"[parallel] START layer1:{rt} t={t0:.3f}")
+
+            resp = tmp_client.chat(
+                message=messages,
+                max_tokens=2000,
+                max_retries=2,
+            )
+
+            t1 = time.time()
+            logger.info(f"[parallel] END   layer1:{rt} t={t1:.3f} dt={t1 - t0:.2f}s")
+
+            if self.log_dir:
+                self._save_agent_log("layer1", rt, role_prompt, user_input_i, resp)
+
+            return rt, resp
+
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            futs = [ex.submit(_one, rt) for rt in ["bazi", "ziwei", "xingpan"]]
+            for f in as_completed(futs):
+                rt, resp = f.result()
+                reports[rt] = resp
 
         return reports
-    
+
     def layer2(self, layer1_reports: Dict[str, LLMResponse], birth_info: str) -> Dict[str, LLMResponse]:
         """
         第二层：三个 agent 参考第一层的三份报告，生成新的报告。
@@ -352,22 +461,15 @@ class MOALayers:
             f"以下是来自其他命理师的三份报告：\n{combined_reports}"
         )
 
-        reports = {}
-        
-        # 并行调用三个 agent
-        for role_type in ['bazi', 'ziwei', 'xingpan']:
-            role = self.roles_layer2[role_type]
-            response = self._call_agent(
-                role, 
-                user_input, 
-                max_tokens=2000,
-                layer_name="layer2",
-                agent_name=role_type
-            )
-            reports[role_type] = response
-        
-        return reports
-    
+        return self._run_agents_parallel(
+            roles=self.roles_layer2,
+            user_input=user_input,
+            layer_name="layer2",
+            max_tokens=2000,
+            max_retries=2,
+            max_workers=3,
+        )
+
     def layer3(
         self,
         layer2_reports: Dict[str, LLMResponse],
@@ -411,22 +513,15 @@ class MOALayers:
             f"以下是来自其他命理师的三份综合分析报告：\n{combined_reports}"
         )
 
-        reports = {}
-        
-        # 并行调用三个 agent
-        for role_type in ['bazi', 'ziwei', 'xingpan']:
-            role = self.roles_layer3[role_type]
-            response = self._call_agent(
-                role, 
-                user_input, 
-                max_tokens=2000,
-                layer_name="layer3",
-                agent_name=role_type
-            )
-            reports[role_type] = response
-        
-        return reports
-    
+        return self._run_agents_parallel(
+            roles=self.roles_layer3,
+            user_input=user_input,
+            layer_name="layer3",
+            max_tokens=2000,
+            max_retries=2,
+            max_workers=3,
+        )
+
     def layer4(
         self,
         layer3_reports: Dict[str, LLMResponse],

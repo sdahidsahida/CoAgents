@@ -210,14 +210,32 @@ async def analyze(request: AnalysisRequest):
         
         # 构建响应数据
         reports_dict = {}
+
         for report_type, content in final_reports.items():
-            layer3_response = results['layer3'][report_type]
-            reports_dict[report_type] = ReportInfo(
-                content=content,
-                total_tokens=layer3_response.total_tokens,
-                elapsed_time=layer3_response.elapsed_time
-            )
-        
+            # 1) 第三层三份报告：bazi/ziwei/xingpan
+            if report_type in ("bazi", "ziwei", "xingpan"):
+                r = results["layer3"][report_type]
+                reports_dict[report_type] = ReportInfo(
+                    content=content,
+                    total_tokens=r.total_tokens,
+                    elapsed_time=r.elapsed_time,
+                )
+                continue
+
+            # 2) 第四层汇总：final
+            if report_type == "final":
+                r = results.get("layer4", {}).get("final", None)
+                if r is not None:
+                    reports_dict["final"] = ReportInfo(
+                        content=content,
+                        total_tokens=r.total_tokens,
+                        elapsed_time=r.elapsed_time,
+                    )
+                else:
+                    # 如果你这次没跑 layer4，就跳过 final
+                    pass
+                continue
+
         # 计算统计信息
         total_tokens = 0
         total_time = 0.0

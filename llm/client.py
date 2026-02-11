@@ -12,8 +12,10 @@ from dotenv import load_dotenv
 from config.config import get_config  # type: ignore
 from llm.response import LLMResponse  # type: ignore
 
-# 加载环境变量
-load_dotenv()
+
+
+_dotenv_path = os.path.join(os.path.dirname(__file__), "..", "config", ".env")
+load_dotenv(dotenv_path=_dotenv_path)
 
 
 class LLMClient:
@@ -39,12 +41,15 @@ class LLMClient:
         >>> for chunk in client.chat_stream("Tell me a story"):
         ...     print(chunk, end='')
     """
-    
+
     def __init__(
-        self,
-        model: Optional[str] = None,
-        config_path: Optional[str] = None
+            self,
+            model: Optional[str] = None,
+            config_path: Optional[str] = None,
+            api_key: Optional[str] = None,
+            base_url: Optional[str] = None,
     ):
+
         """
         初始化 LLM 客户端。
         
@@ -69,16 +74,15 @@ class LLMClient:
         
         # 根据模型名称判断使用哪个 API
         self._provider = self._detect_provider(self.model_name)
-        
-        # 初始化对应的客户端
+
         if self._provider == "deepseek":
-            # DeepSeek 使用 OpenAI SDK
-            api_key = self.config.api_key
-            base_url = self.config.base_url
+            api_key = api_key or self.config.api_key
+            base_url = base_url or self.config.base_url
             self._client = OpenAI(
                 api_key=api_key,
                 base_url=base_url
             )
+
         elif self._provider == "gemini":
             # Gemini 使用 OpenAI SDK 兼容的 API，通过 GEMINI_BASE_URL
             gemini_api_key = os.environ.get('GEMINI_API_KEY')
